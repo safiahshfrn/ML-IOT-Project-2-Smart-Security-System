@@ -109,7 +109,7 @@ audio_rolling_buffer = collections.deque(maxlen=(3*ONE_SECOND_TOTAL_SAMPLES))
 audio_history_48k = collections.deque(maxlen=3*3*ONE_SECOND_TOTAL_SAMPLES)  # 3 seconds of 48kHz samples
 abnormal_history = collections.deque(maxlen=50)
 
-AUDIO_LABELS = ["class1", "class2", "class3", "class4", "class5", "class6", "class7"]
+AUDIO_LABELS = ["glass_breaking", "clock_alarm", "gun_shot", "siren", "screaming", "normal", "silence"]
 
 p = pyaudio.PyAudio()
 stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
