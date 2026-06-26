@@ -15,17 +15,17 @@ are created exactly once via @st.cache_resource, and paho-mqtt's loop_start() ru
 its network loop in a background thread. The UI just reads the shared store.
 """
 
-import base64
 import json
+import time
+import base64
 import random
 import threading
-import time
 from collections import deque
 from datetime import datetime
 
-import paho.mqtt.client as mqtt
 import pandas as pd
 import streamlit as st
+import paho.mqtt.client as mqtt
 from streamlit_autorefresh import st_autorefresh
 
 # ==========================================================================
@@ -36,6 +36,7 @@ MQTT_PORT = 1883
 
 TOPIC_HEARTBEAT = "home/security/fusion_engine/telemetry"   # continuous live telemetry (~1/s)
 TOPIC_ALARM = "home/security/fusion_engine/alarm"           # fired only when the alarm trips
+TOPIC_COMMAND = "home/security/fusion_engine/cmd"           # dashboard -> Pi: ARM / DISARM
 
 MAX_POINTS = 120          # rolling window length for the live charts
 MAX_ALARMS = 200          # how many past alarm events to keep in the log
@@ -62,6 +63,7 @@ class SharedState:
         self.last_msg_time = 0.0                     # local time any msg arrived
         self.last_alarm_time = 0.0                   # local time last alarm arrived
         self.latest_snapshot = None                  # ("b64", data) or ("url", link)
+        self.latest_audio_classes = {}               # {"class1": 12.3, ...} live
         self.connected = False
         self.total_messages = 0
 
@@ -77,6 +79,10 @@ class SharedState:
             })
             self.last_msg_time = time.time()
             self.total_messages += 1
+            # Live per-class audio confidences (new telemetry field)
+            classes = payload.get("audio_all_classes")
+            if isinstance(classes, dict) and classes:
+                self.latest_audio_classes = {k: _num(v) for k, v in classes.items()}
 
     def add_alarm(self, payload):
         with self.lock:
@@ -91,14 +97,17 @@ class SharedState:
                 "max_delta_db": _num(audio.get("max_delta_db")),
                 "best_class_1": audio.get("best_class_1", "—"),
             })
-            # Snapshot can arrive two ways: base64-embedded in the payload, or as a
-            # URL the Pi serves over its local network. Support both.
+            # Snapshot can arrive as: a direct data-URI/base64 string in
+            # camera.saved_snapshot (current Pi code), a separate snapshot_b64
+            # field, or a URL. Support all three.
             snap_b64 = payload.get("snapshot_b64")
-            snap_url = camera.get("saved_snapshot")
+            snap_saved = camera.get("saved_snapshot")
             if snap_b64:
                 self.latest_snapshot = ("b64", snap_b64)
-            elif snap_url and str(snap_url).startswith("http"):
-                self.latest_snapshot = ("url", snap_url)
+            elif isinstance(snap_saved, str) and snap_saved.startswith("data:image"):
+                self.latest_snapshot = ("b64", snap_saved)
+            elif isinstance(snap_saved, str) and snap_saved.startswith("http"):
+                self.latest_snapshot = ("url", snap_saved)
             self.last_msg_time = time.time()
             self.last_alarm_time = time.time()
             self.total_messages += 1
@@ -162,6 +171,15 @@ def get_mqtt_system():
     return client, state
 
 
+def send_command(client, command):
+    """Publish ARM / DISARM to the Pi's command topic."""
+    try:
+        client.publish(TOPIC_COMMAND, command, qos=1)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ==========================================================================
 # 4. PAGE + AUTO-REFRESH
 # ==========================================================================
@@ -173,6 +191,21 @@ st_autorefresh(interval=1000, key="auto_refresh")
 
 client, state = get_mqtt_system()
 
+# WATCHDOG: if the broker silently drops us, the cached client can go dead and
+# never recover. If no message has arrived for a while, force a fresh reconnect.
+RECONNECT_AFTER_SECONDS = 15
+with state.lock:
+    _last = state.last_msg_time
+if _last > 0 and (time.time() - _last) > RECONNECT_AFTER_SECONDS:
+    try:
+        client.reconnect()
+    except Exception:  # noqa: BLE001
+        try:
+            client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+            client.loop_start()
+        except Exception:  # noqa: BLE001
+            pass
+
 # Take a consistent snapshot of shared data under the lock, then release it fast.
 with state.lock:
     heartbeats = list(state.heartbeats)
@@ -181,6 +214,7 @@ with state.lock:
     last_msg_time = state.last_msg_time
     last_alarm_time = state.last_alarm_time
     snapshot = state.latest_snapshot
+    audio_classes = dict(state.latest_audio_classes)
     total_messages = state.total_messages
 
 now = time.time()
@@ -204,6 +238,31 @@ with head_r:
     else:
         st.error("● Disconnected from broker")
     st.caption(f"Messages received: {total_messages}")
+
+
+# ==========================================================================
+# 5b. ARM / DISARM CONTROL  (publishes ARM / DISARM to the Pi)
+# ==========================================================================
+if "armed_cmd" not in st.session_state:
+    st.session_state["armed_cmd"] = True   # assume armed at start
+
+ctrl_l, ctrl_r = st.columns([1, 3])
+with ctrl_l:
+    if st.session_state["armed_cmd"]:
+        if st.button("🔒 DISARM system", use_container_width=True, type="primary"):
+            if send_command(client, "DISARM"):
+                st.session_state["armed_cmd"] = False
+                st.toast("Sent DISARM to the Pi")
+            st.rerun()
+    else:
+        if st.button("🔓 ARM system", use_container_width=True, type="primary"):
+            if send_command(client, "ARM"):
+                st.session_state["armed_cmd"] = True
+                st.toast("Sent ARM to the Pi")
+            st.rerun()
+with ctrl_r:
+    st.caption("This button sends an ARM / DISARM command to the Raspberry Pi over "
+               "MQTT. When disarmed, the Pi stops firing alarms.")
 
 
 # ==========================================================================
@@ -269,10 +328,27 @@ if heartbeats:
         st.line_chart(df[["cam_confidence"]], height=220)
 else:
     st.info(
-        "Live charts will populate once the **heartbeat** topic is publishing "
-        "(`home/security/heartbeat`, ~1/sec). Until then, alarm events below still "
-        "work. Ask Student 3 to enable the heartbeat publish for continuous monitoring."
+        "Live charts will populate once the **telemetry** topic is publishing "
+        "(`home/security/fusion_engine/telemetry`, ~1/sec)."
     )
+
+
+# ==========================================================================
+# 8b. LIVE AUDIO CLASSIFICATION  (horizontal bar chart, updates every second)
+# ==========================================================================
+st.subheader("Live audio classification")
+if audio_classes:
+    audio_df = pd.DataFrame(
+        {"confidence": audio_classes}
+    ).sort_values("confidence", ascending=True)
+    st.caption("Per-class confidence (%) — updates live with each telemetry message")
+    try:
+        st.bar_chart(audio_df, horizontal=True, height=280)
+    except TypeError:
+        # Older Streamlit without the `horizontal` argument
+        st.bar_chart(audio_df, height=280)
+else:
+    st.info("Waiting for audio-class data from the telemetry stream…")
 
 
 # ==========================================================================
@@ -284,8 +360,15 @@ snap_col, info_col = st.columns([1, 1])
 with snap_col:
     if snapshot and snapshot[0] == "b64":
         try:
-            st.image(base64.b64decode(snapshot[1]),
-                     caption="Captured at last alarm", use_container_width=True)
+            raw = snapshot[1]
+            # Chan's Pi sends a data-URI ("data:image/jpeg;base64,...."). st.image can
+            # render that string directly. If it's a bare base64 string, decode it.
+            if isinstance(raw, str) and raw.startswith("data:image"):
+                st.image(raw, caption="Captured at last alarm",
+                         use_container_width=True)
+            else:
+                st.image(base64.b64decode(raw),
+                         caption="Captured at last alarm", use_container_width=True)
         except Exception:  # noqa: BLE001
             st.warning("Snapshot received but could not be decoded.")
     elif snapshot and snapshot[0] == "url":
