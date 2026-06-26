@@ -1,38 +1,39 @@
-import time
-import datetime
 import collections
+import datetime
 import json
-import numpy as np
-import pyaudio
-import cv2
-import onnxruntime as ort
-import ai_edge_litert.interpreter as litert
-import RPi.GPIO as GPIO
-import paho.mqtt.client as mqtt  
-import threading
 import queue
-import scipy.io.wavfile as wav 
+import threading
+import time
+
+import ai_edge_litert.interpreter as litert
+import cv2
+import numpy as np
+import onnxruntime as ort
+import paho.mqtt.client as mqtt
+import pyaudio
+import RPi.GPIO as GPIO
+import scipy.io.wavfile as wav
 
 # ==========================================
 # 1. HARDWARE CONFIGURATION
 # ==========================================
-BUZZER_PIN = 23  
+BUZZER_PIN = 23
 LED_PIN = 17
-PIR_PIN = 18  
+PIR_PIN = 18
 CAMERA_INDEX = 0
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(BUZZER_PIN, GPIO.OUT)
-GPIO.setup(LED_PIN, GPIO.OUT)       
+GPIO.setup(LED_PIN, GPIO.OUT)
 GPIO.setup(PIR_PIN, GPIO.IN)
 
-GPIO.output(BUZZER_PIN, GPIO.LOW) 
+GPIO.output(BUZZER_PIN, GPIO.LOW)
 GPIO.output(LED_PIN, GPIO.LOW)
 
 # ==========================================
 # 2. MQTT NETWORK TELEMETRY CONFIGURATION
 # ==========================================
-MQTT_BROKER = "broker.hivemq.com"  
+MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
 MQTT_ALARM_TOPIC = "home/security/fusion_engine/alarm"
 MQTT_TELEMETRY_TOPIC = "home/security/fusion_engine/telemetry"
@@ -70,8 +71,8 @@ threading.Thread(target=mqtt_worker_thread, daemon=True).start()
 # ==========================================
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-RATE = 48000  
-CHUNK = 2048  
+RATE = 48000
+CHUNK = 2048
 
 ONE_SECOND_TOTAL_SAMPLES = 16000
 audio_rolling_buffer = collections.deque(maxlen=(3*ONE_SECOND_TOTAL_SAMPLES))
@@ -106,11 +107,11 @@ video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 # ==========================================
 # 5. MATH HOOKS & TARGET DEFINITION
 # ==========================================
-ART_AOI_BOX = [160, 160, 480, 480] 
+ART_AOI_BOX = [160, 160, 480, 480]
 last_capture_time = 0
-CAPTURE_COOLDOWN = 3.0  
-PIR_DECAY_TIME = 3.0       
-pir_expiration_time = 0.0   
+CAPTURE_COOLDOWN = 3.0
+PIR_DECAY_TIME = 3.0
+pir_expiration_time = 0.0
 
 # Heartbeat interval telemetry control
 last_heartbeat_time = 0
@@ -121,8 +122,8 @@ def preprocess_frame(frame):
     resized = cv2.resize(frame, (640, 640))
     rgb_img = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
     blob = np.float32(rgb_img) / 255.0
-    blob = np.transpose(blob, (2, 0, 1))  
-    blob = np.expand_dims(blob, axis=0)   
+    blob = np.transpose(blob, (2, 0, 1))
+    blob = np.expand_dims(blob, axis=0)
     return blob
 
 def check_intersection(box_a, box_b):
@@ -157,9 +158,9 @@ try:
         try:
             raw_data = stream.read(CHUNK, exception_on_overflow=False)
             signal_samples = np.frombuffer(raw_data, dtype=np.int16)
-            audio_history_48k.extend(signal_samples) 
+            audio_history_48k.extend(signal_samples)
         except IOError:
-            continue  
+            continue
 
         # Calculate raw sound levels
         rms = np.sqrt(np.mean(signal_samples.astype(np.float32)**2)) if len(signal_samples) > 0 else 0
@@ -169,12 +170,12 @@ try:
         if GPIO.input(BUZZER_PIN) == GPIO.HIGH:
             current_db = last_valid_db
         else:
-            last_valid_db = current_db  
+            last_valid_db = current_db
 
         # Downsample and run quantization process
         downsampled_samples = signal_samples[::3].astype(np.float32) / 32768.0
         quantized_samples = quantize_audio(downsampled_samples)
-        
+
         # 🟢 FIX: Only push once to avoid timeline shifting / duplication bugs
         audio_rolling_buffer.extend(quantized_samples)
 
@@ -195,7 +196,7 @@ try:
 
         normal_pool = audio_probabilities[0] + audio_probabilities[5] + audio_probabilities[6]
         abnormal_pool = 1.0 - normal_pool
-        
+
         is_anomaly = False
         if len(abnormal_history) >= 30:
             current_mean = np.mean(abnormal_history)
@@ -220,7 +221,7 @@ try:
             sorted_indices = list(np.argsort(audio_probabilities))
             if 5 in sorted_indices:
                 sorted_indices.remove(5)
-            
+
             top1_idx = sorted_indices[-1]
             top2_idx = sorted_indices[-2]
             top1_name = AUDIO_LABELS[top1_idx]
@@ -238,18 +239,18 @@ try:
             annotated_frame = cv2.resize(frame, (640, 640))
             input_data = preprocess_frame(frame)
             vision_output = camera_session.run(None, {camera_input_name: input_data})
-            raw_predictions = vision_output[0][0] 
+            raw_predictions = vision_output[0][0]
             class_confidences = raw_predictions[4:, :]
-            cam_confidence = float(np.max(class_confidences)) * 100.0 
-            
+            cam_confidence = float(np.max(class_confidences)) * 100.0
+
             if (cam_confidence / 100.0) > 0.40:
                 best_match_idx = np.argmax(np.max(class_confidences, axis=0))
                 box_coords = raw_predictions[0:4, best_match_idx]
                 cx, cy, w, h = box_coords
                 human_box = [int(cx - w/2), int(cy - h/2), int(cx + w/2), int(cy + h/2)]
-                
+
                 aoi_active = check_intersection(human_box, ART_AOI_BOX)
-                
+
                 cv2.rectangle(annotated_frame, (human_box[0], human_box[1]), (human_box[2], human_box[3]), (0, 255, 255), 2)
                 cv2.putText(annotated_frame, f"Human Conf: {(cam_confidence/100.0):.2f}", (human_box[0] + 10, human_box[1] + 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
@@ -268,42 +269,42 @@ try:
             try:
                 mqtt_queue.put_nowait((MQTT_TELEMETRY_TOPIC, heartbeat_payload))
             except queue.Full:
-                pass 
+                pass
             last_heartbeat_time = current_time
 
         # ==========================================
         # 🚨 STEP 4: THE 3 PATHWAY THRESHOLD EVALUATION
         # ==========================================
-        Z_THRESHOLD = 2.0           
-        DECIBEL_TRIGGER_LIMIT = 80.0  
+        Z_THRESHOLD = 10.0
+        DECIBEL_TRIGGER_LIMIT = 80.0
 
         cond_camera = (cam_confidence > 80.0) and aoi_active
         cond_audio_spike = z_score > Z_THRESHOLD
         cond_pir_decibel = pir_active and (current_db > DECIBEL_TRIGGER_LIMIT)
 
         if cond_camera or cond_audio_spike or cond_pir_decibel:
-            
-            # Fire hardware alerts instantly for real-time responsiveness
-            GPIO.output(BUZZER_PIN, GPIO.HIGH) 
-            GPIO.output(LED_PIN, GPIO.HIGH)        
 
-            filename = "None"  
+            # Fire hardware alerts instantly for real-time responsiveness
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)
+            GPIO.output(LED_PIN, GPIO.HIGH)
+
+            filename = "None"
             current_time_snap = time.time()
-            
+
             # 🟢 FIX: Scope expanded to top level of execution block to resolve missing reference crashes
             timestamp_fs = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            
+
             if current_time_snap - last_capture_time > CAPTURE_COOLDOWN:
                 # 📷 Save the camera frame instantly
                 if annotated_frame is not None:
                     box_color = (0, 0, 255) if aoi_active else (0, 255, 0)
                     cv2.rectangle(annotated_frame, (ART_AOI_BOX[0], ART_AOI_BOX[1]), (ART_AOI_BOX[2], ART_AOI_BOX[3]), box_color, 3)
-                    cv2.putText(annotated_frame, "CRITICAL PERIMETER VIOLATION" if aoi_active else "PERIMETER SECURE", 
+                    cv2.putText(annotated_frame, "CRITICAL PERIMETER VIOLATION" if aoi_active else "PERIMETER SECURE",
                                 (ART_AOI_BOX[0] + 10, ART_AOI_BOX[1] + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-                    
+
                     filename = f"/home/user/iot_project/BESTMODEL/camera_alerts/tripwire_breach_{timestamp_fs}.jpg"
                     cv2.imwrite(filename, annotated_frame)
-                
+
                 # 🎙️ POST-TRIGGER CAPTURE DELAY (CENTERING HOOK)
                 post_trigger_duration = 1.5
                 start_wait = time.time()
@@ -317,7 +318,7 @@ try:
 
                 audio_filename = f"/home/user/iot_project/BESTMODEL/audio_alerts/audio_breach_{timestamp_fs}.wav"
                 native_buffer = np.array(audio_history_48k)
-                
+
                 if len(native_buffer) >= 144000:
                     audio_window = native_buffer[-144000:]
                 else:
@@ -325,7 +326,7 @@ try:
 
                 # Write out the perfectly centered 3-second audio asset
                 wav.write(audio_filename, 48000, audio_window)
-                
+
                 # 🟢 FIX: Explicitly evaluate completion time post-delay to prevent truncated cooldown windows
                 last_capture_time = time.time()
 
@@ -348,7 +349,7 @@ try:
                     "max_delta_db": round(float(current_db), 1),
                     "best_class_1": f"{top1_name.upper()} ({top1_prob:.1f}%)",
                     "best_class_2": f"{top2_name.upper()} ({top2_prob:.1f}%)",
-                    "raw_window_samples": full_second_snapshot.tolist()  
+                    "raw_window_samples": full_second_snapshot.tolist()
                 },
                 "pir_detected": bool(pir_active),
                 "camera": {
@@ -376,8 +377,8 @@ try:
 
             # Turn off hardware alerts
             GPIO.output(BUZZER_PIN, GPIO.LOW)
-            GPIO.output(LED_PIN, GPIO.LOW)         
-            
+            GPIO.output(LED_PIN, GPIO.LOW)
+
             # 🧹 FLUSH INTERNAL HARDWARE AUDIO BUFFER
             try:
                 while stream.get_read_available() > 0:
