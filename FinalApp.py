@@ -15,17 +15,17 @@ are created exactly once via @st.cache_resource, and paho-mqtt's loop_start() ru
 its network loop in a background thread. The UI just reads the shared store.
 """
 
-import json
-import time
 import base64
+import json
 import random
 import threading
+import time
 from collections import deque
 from datetime import datetime
 
+import paho.mqtt.client as mqtt
 import pandas as pd
 import streamlit as st
-import paho.mqtt.client as mqtt
 from streamlit_autorefresh import st_autorefresh
 
 # ==========================================================================
@@ -256,28 +256,44 @@ with head_r:
 
 
 # ==========================================================================
-# 5b. ARM / DISARM CONTROL  (publishes ARM / DISARM to the Pi)
+# 5b. CONTROLS: ARM/DISARM (alarms) + SLEEP/WAKE (camera inference)
 # ==========================================================================
 if "armed_cmd" not in st.session_state:
     st.session_state["armed_cmd"] = True   # assume armed at start
+if "awake_cmd" not in st.session_state:
+    st.session_state["awake_cmd"] = True    # assume camera awake at start
 
-ctrl_l, ctrl_r = st.columns([1, 3])
-with ctrl_l:
+ctrl_a, ctrl_b, ctrl_c = st.columns([1, 1, 2])
+with ctrl_a:
     if st.session_state["armed_cmd"]:
-        if st.button("🔒 DISARM system", use_container_width=True, type="primary"):
+        if st.button("🔒 DISARM alarms", use_container_width=True, type="primary"):
             if send_command(client, "DISARM"):
                 st.session_state["armed_cmd"] = False
                 st.toast("Sent DISARM to the Pi")
             st.rerun()
     else:
-        if st.button("🔓 ARM system", use_container_width=True, type="primary"):
+        if st.button("🔓 ARM alarms", use_container_width=True, type="primary"):
             if send_command(client, "ARM"):
                 st.session_state["armed_cmd"] = True
                 st.toast("Sent ARM to the Pi")
             st.rerun()
-with ctrl_r:
-    st.caption("This button sends an ARM / DISARM command to the Raspberry Pi over "
-               "MQTT. When disarmed, the Pi stops firing alarms.")
+with ctrl_b:
+    if st.session_state["awake_cmd"]:
+        if st.button("💤 SLEEP camera", use_container_width=True):
+            if send_command(client, "SLEEP"):
+                st.session_state["awake_cmd"] = False
+                st.toast("Camera inference paused — CPU freed (SSH easier)")
+            st.rerun()
+    else:
+        if st.button("☀️ WAKE camera", use_container_width=True):
+            if send_command(client, "WAKE"):
+                st.session_state["awake_cmd"] = True
+                st.toast("Camera inference resumed")
+            st.rerun()
+with ctrl_c:
+    st.caption("**ARM/DISARM** controls whether the Pi fires alarms. "
+               "**SLEEP/WAKE** pauses the heavy camera inference to free the Pi's "
+               "CPU (useful when you need to SSH in). Audio keeps running either way.")
 
 
 # ==========================================================================
@@ -333,7 +349,7 @@ if heartbeats:
     df = df.set_index("time")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.caption("Audio anomaly z-score (trips at 8.0σ)")
+        st.caption("Audio anomaly z-score (trips at 2.0σ)")
         st.line_chart(df[["z_score"]], height=220)
     with c2:
         st.caption("Sound level (dB)")

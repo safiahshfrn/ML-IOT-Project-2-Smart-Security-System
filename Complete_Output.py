@@ -309,8 +309,8 @@ try:
         # ==========================================
         # 🚨 STEP 4: THE 3 PATHWAY THRESHOLD EVALUATION
         # ==========================================
-        Z_THRESHOLD = 20.0
-        DECIBEL_TRIGGER_LIMIT = 140.0
+        Z_THRESHOLD = 8.0
+        DECIBEL_TRIGGER_LIMIT = 110.0
 
         cond_camera = (cam_confidence > 80.0) and aoi_active
         cond_audio_spike = z_score > Z_THRESHOLD
@@ -323,6 +323,7 @@ try:
             GPIO.output(LED_PIN, GPIO.HIGH)
 
             filename = "None"
+            audio_b64_string = None
             current_time_snap = time.time()
 
             # 🟢 FIX: Scope expanded to top level of execution block to resolve missing reference crashes
