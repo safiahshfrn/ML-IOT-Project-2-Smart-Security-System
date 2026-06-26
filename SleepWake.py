@@ -43,20 +43,28 @@ MQTT_TELEMETRY_TOPIC = "home/security/fusion_engine/telemetry"
 mqtt_queue = queue.Queue(maxsize=100)
 # Initialize these globally BEFORE starting the MQTT worker thread
 alerts_enabled = True
+inference_enabled = True   # camera ML inference; SLEEP frees the CPU for SSH
 MQTT_COMMAND_TOPIC = "home/security/fusion_engine/cmd"
 
 def mqtt_worker_thread():
     """Background worker that continuously handles MQTT publishing without blocking main loop."""
-    global alerts_enabled
+    global alerts_enabled, inference_enabled
     print("Connecting background MQTT Worker...")
     worker_client = mqtt.Client()
 
     # 🟢 NEW: Callback to handle incoming dashboard button clicks
     def on_message(client, userdata, msg):
-        global alerts_enabled
+        global alerts_enabled, inference_enabled
         try:
             command = msg.payload.decode("utf-8").strip().upper()
-            if "DISARM" in command:
+            # Camera-inference control (checked first; SLEEP/WAKE are distinct words)
+            if "SLEEP" in command:
+                inference_enabled = False
+                print("\n💤 Camera inference PAUSED via Dashboard (CPU freed for SSH).")
+            elif "WAKE" in command:
+                inference_enabled = True
+                print("\n☀️ Camera inference RESUMED via Dashboard.")
+            elif "DISARM" in command:
                 alerts_enabled = False
                 print("\n🔒 System DISARMED via Dashboard Command.")
             elif "ARM" in command:
@@ -167,8 +175,17 @@ print("🏠 High-Performance Fused Security Engine Active & Calibrating...")
 time.sleep(3)
 print("⚡ Monitoring Guard Active.")
 
+# Camera throttle: run the heavy YOLO inference once every N loops to free CPU.
+CAMERA_EVERY_N_LOOPS = 4
+loop_counter = 0
+# Persist last camera result between the loops where we skip inference.
+cam_confidence = 0.0
+aoi_active = False
+annotated_frame = None
+
 try:
     while True:
+        loop_counter += 1
         # 🟢 STEP 1: PIR DETECTION WITH SOFTWARE DECAY
         raw_pir = GPIO.input(PIR_PIN)
         current_time = time.time()
@@ -255,32 +272,44 @@ try:
             top2_prob = audio_probabilities[top2_idx] * 100
 
         # 🟢 STEP 3: RUN CAMERA SCANNING CORE
-        ret, frame = video_capture.read()
-        cam_confidence = 0.0
-        aoi_active = False
-        annotated_frame = None
+        # Only run the heavy YOLO inference when (a) inference is not paused via
+        # the dashboard SLEEP command, and (b) it's a throttled loop iteration.
+        # When skipped, we keep the previous cam_confidence/aoi/frame values so
+        # the rest of the loop and telemetry still have something to report.
+        run_camera = inference_enabled and (loop_counter % CAMERA_EVERY_N_LOOPS == 0)
 
-        if ret:
-            annotated_frame = cv2.resize(frame, (640, 640))
-            input_data = preprocess_frame(frame)
-            vision_output = camera_session.run(None, {camera_input_name: input_data})
-            raw_predictions = vision_output[0][0]
-            class_confidences = raw_predictions[4:, :]
-            cam_confidence = float(np.max(class_confidences)) * 100.0
+        if run_camera:
+            ret, frame = video_capture.read()
+            cam_confidence = 0.0
+            aoi_active = False
+            annotated_frame = None
 
-            if (cam_confidence / 100.0) > 0.40:
-                best_match_idx = np.argmax(np.max(class_confidences, axis=0))
-                box_coords = raw_predictions[0:4, best_match_idx]
-                cx, cy, w, h = box_coords
-                human_box = [int(cx - w/2), int(cy - h/2), int(cx + w/2), int(cy + h/2)]
+            if ret:
+                annotated_frame = cv2.resize(frame, (640, 640))
+                input_data = preprocess_frame(frame)
+                vision_output = camera_session.run(None, {camera_input_name: input_data})
+                raw_predictions = vision_output[0][0]
+                class_confidences = raw_predictions[4:, :]
+                cam_confidence = float(np.max(class_confidences)) * 100.0
 
-                aoi_active = check_intersection(human_box, ART_AOI_BOX)
+                if (cam_confidence / 100.0) > 0.40:
+                    best_match_idx = np.argmax(np.max(class_confidences, axis=0))
+                    box_coords = raw_predictions[0:4, best_match_idx]
+                    cx, cy, w, h = box_coords
+                    human_box = [int(cx - w/2), int(cy - h/2), int(cx + w/2), int(cy + h/2)]
 
-                cv2.rectangle(annotated_frame, (human_box[0], human_box[1]), (human_box[2], human_box[3]), (0, 255, 255), 2)
-                cv2.putText(annotated_frame, f"Human Conf: {(cam_confidence/100.0):.2f}", (human_box[0] + 10, human_box[1] + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                    aoi_active = check_intersection(human_box, ART_AOI_BOX)
 
-        print(f"Tracking.. Z: {z_score:4.1f}σ | PIR: {pir_string} | CAM: {cam_confidence:.1f}% ", end='\r')
+                    cv2.rectangle(annotated_frame, (human_box[0], human_box[1]), (human_box[2], human_box[3]), (0, 255, 255), 2)
+                    cv2.putText(annotated_frame, f"Human Conf: {(cam_confidence/100.0):.2f}", (human_box[0] + 10, human_box[1] + 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        elif not inference_enabled:
+            # Asleep: report camera as inactive so it can't trigger an alarm.
+            cam_confidence = 0.0
+            aoi_active = False
+
+        cam_status = "ON" if inference_enabled else "SLEEP"
+        print(f"Tracking.. Z: {z_score:4.1f}σ | PIR: {pir_string} | CAM[{cam_status}]: {cam_confidence:.1f}% ", end='\r')
 
         image_payload_string = "COOLDOWN_ACTIVE_NO_IMAGE"
         # 🟢 CONTINUOUS SUB-THREAD HEARTBEAT TELEMETRY FOR DASHBOARDS
