@@ -12,6 +12,14 @@ dashboard.
 
 ---
 
+## Dataset
+The dataset used in this project is too large to upload to GitHub. You can download it via Google Drive:
+🔗 Download Dataset from Google Drive
+
+After downloading, place the dataset files in the appropriate folder before running the project.
+
+---
+
 ## Overview
 
 The system continuously watches a space using three sensors and raises an alarm the
