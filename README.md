@@ -14,7 +14,7 @@ dashboard.
 
 ## Dataset
 The dataset used in this project is too large to upload to GitHub. You can download it via Google Drive:
-🔗 Download Dataset from Google Drive
+🔗 Download Dataset from Google Drive: https://drive.google.com/drive/folders/1yi3F_ZLjay5af31KPMDVFAOSQexNNEWL?usp=drive_link
 
 After downloading, place the dataset files in the appropriate folder before running the project.
 
